@@ -24,8 +24,10 @@ import org.apache.celeborn.common.internal.Logging
 class CelebornShuffleFallbackPolicyRunner(conf: CelebornConf) extends Logging {
 
   def applyAllFallbackPolicy(lifecycleManager: LifecycleManager, numPartitions: Int): Boolean = {
-    applyForceFallbackPolicy() || applyShufflePartitionsFallbackPolicy(numPartitions) ||
-    !checkQuota(lifecycleManager) || !checkWorkersAvailable(lifecycleManager)
+    applyForceFallbackPolicy() || // 配置启用强制 fallback
+      applyShufflePartitionsFallbackPolicy(numPartitions) || // 分区数大于阈值（默认 500000）
+      !checkQuota(lifecycleManager) || // 超出 Quota
+      !checkWorkersAvailable(lifecycleManager) // 没有可用的 Worker
   }
 
   /**

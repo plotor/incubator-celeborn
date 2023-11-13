@@ -17,12 +17,16 @@
 
 package org.apache.spark.shuffle.celeborn;
 
-import java.io.IOException;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.atomic.AtomicInteger;
-
-import org.apache.spark.*;
+import org.apache.celeborn.client.LifecycleManager;
+import org.apache.celeborn.client.ShuffleClient;
+import org.apache.celeborn.common.CelebornConf;
+import org.apache.celeborn.common.protocol.ShuffleMode;
+import org.apache.celeborn.common.util.ThreadUtils;
+import org.apache.celeborn.reflect.DynMethods;
+import org.apache.spark.ShuffleDependency;
+import org.apache.spark.SparkConf;
+import org.apache.spark.SparkContext$;
+import org.apache.spark.TaskContext;
 import org.apache.spark.launcher.SparkLauncher;
 import org.apache.spark.shuffle.*;
 import org.apache.spark.shuffle.sort.SortShuffleManager;
@@ -30,12 +34,10 @@ import org.apache.spark.util.Utils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.celeborn.client.LifecycleManager;
-import org.apache.celeborn.client.ShuffleClient;
-import org.apache.celeborn.common.CelebornConf;
-import org.apache.celeborn.common.protocol.ShuffleMode;
-import org.apache.celeborn.common.util.ThreadUtils;
-import org.apache.celeborn.reflect.DynMethods;
+import java.io.IOException;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class SparkShuffleManager implements ShuffleManager {
 
@@ -67,6 +69,9 @@ public class SparkShuffleManager implements ShuffleManager {
   private long sendBufferPoolCheckInterval;
   private long sendBufferPoolExpireTimeout;
 
+  /**
+   * 创建 SparkEnv 时触发实例化
+   */
   public SparkShuffleManager(SparkConf conf, boolean isDriver) {
     if (conf.getBoolean(LOCAL_SHUFFLE_READER_KEY, true)) {
       logger.warn(
@@ -81,6 +86,7 @@ public class SparkShuffleManager implements ShuffleManager {
     this.fallbackPolicyRunner = new CelebornShuffleFallbackPolicyRunner(celebornConf);
     if (ShuffleMode.SORT.equals(celebornConf.shuffleWriterMode())
         && celebornConf.clientPushSortPipelineEnabled()) {
+      // 异步 push 线程集合
       asyncPushers = new ExecutorService[cores];
       for (int i = 0; i < asyncPushers.length; i++) {
         asyncPushers[i] = ThreadUtils.newDaemonSingleThreadExecutor("async-pusher-" + i);
@@ -125,8 +131,10 @@ public class SparkShuffleManager implements ShuffleManager {
     // is the same SparkContext among different shuffleIds.
     // This method may be called many times.
     appUniqueId = SparkUtils.appUniqueId(dependency.rdd().context());
+    // 如果是 Driver 则创建并初始化 LifecycleManager
     initializeLifecycleManager();
 
+    // 检查是否需要 fallback
     if (fallbackPolicyRunner.applyAllFallbackPolicy(
         lifecycleManager, dependency.partitioner().numPartitions())) {
       if (conf.getBoolean("spark.dynamicAllocation.enabled", false)) {
@@ -140,7 +148,9 @@ public class SparkShuffleManager implements ShuffleManager {
       }
       sortShuffleIds.add(shuffleId);
       return sortShuffleManager().registerShuffle(shuffleId, dependency);
-    } else {
+    }
+    // 不需要 fallback，走 RSS
+    else {
       return new CelebornShuffleHandle<>(
           appUniqueId,
           lifecycleManager.getHost(),

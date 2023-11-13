@@ -17,25 +17,27 @@
 
 package org.apache.celeborn.service.deploy.master.clustermeta.ha;
 
-import java.io.File;
-import java.io.IOException;
-
 import com.google.protobuf.InvalidProtocolBufferException;
-import org.apache.ratis.protocol.Message;
-import org.apache.ratis.statemachine.impl.SimpleStateMachineStorage;
-import org.apache.ratis.statemachine.impl.SimpleStateMachineStorageUtil;
-import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
-
 import org.apache.celeborn.common.exception.CelebornIOException;
 import org.apache.celeborn.common.haclient.MasterNotLeaderException;
 import org.apache.celeborn.common.rpc.RpcCallContext;
 import org.apache.celeborn.service.deploy.master.clustermeta.AbstractMetaManager;
 import org.apache.celeborn.service.deploy.master.clustermeta.ResourceProtos;
+import org.apache.ratis.protocol.Message;
+import org.apache.ratis.statemachine.impl.SimpleStateMachineStorage;
+import org.apache.ratis.statemachine.impl.SimpleStateMachineStorageUtil;
+import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
+
+import java.io.File;
+import java.io.IOException;
 
 public class HAHelper {
 
+  /**
+   * 检查当前是不是 leader，如果是则返回 true
+   */
   public static boolean checkShouldProcess(
-      RpcCallContext context, AbstractMetaManager masterStatusSystem) {
+          RpcCallContext context, AbstractMetaManager masterStatusSystem) {
     HARaftServer ratisServer = getRatisServer(masterStatusSystem);
     if (ratisServer != null) {
       if (ratisServer.isLeader()) {

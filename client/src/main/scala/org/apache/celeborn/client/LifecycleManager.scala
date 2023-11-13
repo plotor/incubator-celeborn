@@ -109,6 +109,7 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
     ThreadUtils.newDaemonSingleThreadScheduledExecutor("master-forward-message-thread")
   private var checkForShuffleRemoval: ScheduledFuture[_] = _
 
+  // 启动 RPC 服务，端口随机
   // init driver celeborn LifecycleManager rpc service
   override val rpcEnv: RpcEnv = RpcEnv.create(
     RpcNameConstants.LIFECYCLE_MANAGER_SYS,
@@ -119,8 +120,11 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
 
   logInfo(s"Starting LifecycleManager on ${rpcEnv.address}")
 
+  // 创建 Master RPC 客户端
   private val masterClient = new MasterClient(rpcEnv, conf)
+  // 创建 CommitManager
   val commitManager = new CommitManager(appUniqueId, conf, this)
+  // 创建 CommitManager
   val workerStatusTracker = new WorkerStatusTracker(conf, this)
   private val heartbeater =
     new ApplicationHeartbeater(

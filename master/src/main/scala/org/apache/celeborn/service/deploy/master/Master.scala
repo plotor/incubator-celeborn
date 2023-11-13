@@ -58,6 +58,7 @@ private[celeborn] class Master(
   override val metricsSystem: MetricsSystem =
     MetricsSystem.createMetricsSystem(serviceName, conf, MetricsSystem.SERVLET_PATH)
 
+  // 启动 RPC 服务，默认端口 9097
   override val rpcEnv: RpcEnv = RpcEnv.create(
     RpcNameConstants.MASTER_SYS,
     masterArgs.host,
@@ -71,6 +72,7 @@ private[celeborn] class Master(
       val sys = new HAMasterMetaManager(rpcEnv, conf)
       val handler = new MetaHandler(sys)
       try {
+        // 启动 Raft Server
         handler.setUpMasterRatisServer(conf, masterArgs.masterClusterInfo.get)
       } catch {
         case ioe: IOException =>
@@ -106,6 +108,7 @@ private[celeborn] class Master(
   private val hdfsExpireDirsTimeoutMS = conf.hdfsExpireDirsTimeoutMS
   private val hasHDFSStorage = conf.hasHDFSStorage
 
+  // 初始化 QuotaManager
   private val quotaManager = QuotaManager.instantiate(conf)
   private val masterResourceConsumptionInterval = conf.masterResourceConsumptionInterval
   private val userResourceConsumptions =
@@ -134,6 +137,7 @@ private[celeborn] class Master(
     conf.estimatedPartitionSizeForEstimationUpdateInterval
   private val partitionSizeUpdateService =
     ThreadUtils.newDaemonSingleThreadScheduledExecutor("partition-size-updater")
+  // 定期更新 Partition 数量
   partitionSizeUpdateService.scheduleAtFixedRate(
     new Runnable {
       override def run(): Unit = {
@@ -144,9 +148,10 @@ private[celeborn] class Master(
           })
       }
     },
-    estimatedPartitionSizeUpdaterInitialDelay,
-    estimatedPartitionSizeForEstimationUpdateInterval,
+    estimatedPartitionSizeUpdaterInitialDelay, // 默认 5min
+    estimatedPartitionSizeForEstimationUpdateInterval, // 默认 10min
     TimeUnit.MILLISECONDS)
+  // slot 分配策略，默认为 round-robin
   private val slotsAssignPolicy = conf.masterSlotAssignPolicy
 
   // init and register master metrics
@@ -170,6 +175,7 @@ private[celeborn] class Master(
   metricsSystem.registerSource(new JVMCPUSource(conf, MetricsSystem.ROLE_MASTER))
   metricsSystem.registerSource(new SystemMiscSource(conf, MetricsSystem.ROLE_MASTER))
 
+  // 注册 RPC 节点
   rpcEnv.setupEndpoint(RpcNameConstants.MASTER_EP, this)
 
   // start threads to check timeout for workers and applications
@@ -181,7 +187,7 @@ private[celeborn] class Master(
         }
       },
       0,
-      workerHeartbeatTimeoutMs,
+      workerHeartbeatTimeoutMs, // 默认 120s
       TimeUnit.MILLISECONDS)
 
     checkForApplicationTimeOutTask = forwardMessageThread.scheduleAtFixedRate(
@@ -191,7 +197,7 @@ private[celeborn] class Master(
         }
       },
       0,
-      appHeartbeatTimeoutMs / 2,
+      appHeartbeatTimeoutMs / 2, // 默认 150s
       TimeUnit.MILLISECONDS)
 
     checkForUnavailableWorkerTimeOutTask = forwardMessageThread.scheduleAtFixedRate(
@@ -201,7 +207,7 @@ private[celeborn] class Master(
         }
       },
       0,
-      workerUnavailableInfoExpireTimeoutMs / 2,
+      workerUnavailableInfoExpireTimeoutMs / 2, // 900s
       TimeUnit.MILLISECONDS)
 
     if (hasHDFSStorage) {
@@ -212,7 +218,7 @@ private[celeborn] class Master(
           }
         },
         hdfsExpireDirsTimeoutMS,
-        hdfsExpireDirsTimeoutMS,
+        hdfsExpireDirsTimeoutMS, // 1h
         TimeUnit.MILLISECONDS)
     }
 
@@ -241,7 +247,10 @@ private[celeborn] class Master(
     logDebug(s"Client $address got disassociated.")
   }
 
-  def executeWithLeaderChecker[T](context: RpcCallContext, f: => T): Unit =
+  /**
+   * 判断当前是不是 leader，如果是则执行 {@code f}
+   */
+  def executeWithLeaderChecker[T](context: RpcCallContext, f: => T): Unit = {
     if (HAHelper.checkShouldProcess(context, statusSystem)) {
       try {
         f
@@ -250,6 +259,7 @@ private[celeborn] class Master(
           HAHelper.sendFailure(context, HAHelper.getRatisServer(statusSystem), e)
       }
     }
+  }
 
   override def receive: PartialFunction[Any, Unit] = {
     case _: PbCheckForWorkerTimeout =>
@@ -971,10 +981,21 @@ private[celeborn] class Master(
 
 private[deploy] object Master extends Logging {
   def main(args: Array[String]): Unit = {
+    // 加载系统环境变量
     val conf = new CelebornConf()
+    // 解析命令行参数、celeborn-defaults.properties
     val masterArgs = new MasterArguments(args, conf)
     try {
+
+      /*
+       * 创建 Master：
+       * 1. 启动 RPC 服务，默认端口 9097
+       * 2. 如果是 HA 集群则启动 Raft Server
+       * 3. 初始化 QuotaManager
+       * 4. 启动一些周期性任务
+       */
       val master = new Master(conf, masterArgs)
+      // 初始化，主要是启动 metrics 系统
       master.initialize()
     } catch {
       case e: Throwable =>

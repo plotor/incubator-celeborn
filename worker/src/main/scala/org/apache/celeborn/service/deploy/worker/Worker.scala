@@ -64,6 +64,7 @@ private[celeborn] class Worker(
   override val metricsSystem: MetricsSystem =
     MetricsSystem.createMetricsSystem(serviceName, conf, MetricsSystem.SERVLET_PATH)
 
+  // 启动 RPC 服务，端口随机
   val rpcEnv: RpcEnv = RpcEnv.create(
     RpcNameConstants.WORKER_SYS,
     workerArgs.host,
@@ -78,6 +79,7 @@ private[celeborn] class Worker(
 
   private val WORKER_SHUTDOWN_PRIORITY = 100
   val shutdown = new AtomicBoolean(false)
+  // 是否启用 graceful shutdown
   private val gracefulShutdown = conf.workerGracefulShutdown
   private var exitKind = CelebornExitKind.EXIT_IMMEDIATELY
   if (gracefulShutdown) {
@@ -110,19 +112,23 @@ private[celeborn] class Worker(
   metricsSystem.registerSource(new JVMCPUSource(conf, MetricsSystem.ROLE_WORKER))
   metricsSystem.registerSource(new SystemMiscSource(conf, MetricsSystem.ROLE_WORKER))
 
+  // 创建 StorageManager
   val storageManager = new StorageManager(conf, workerSource)
 
+  // 初始化 MemoryManager
   val memoryManager: MemoryManager = MemoryManager.initialize(conf)
   memoryManager.registerMemoryListener(storageManager)
 
   val partitionsSorter = new PartitionFilesSorter(memoryManager, conf, workerSource)
 
+  // 启用拥塞控制
   if (conf.workerCongestionControlEnabled) {
     if (conf.workerCongestionControlLowWatermark.isEmpty || conf.workerCongestionControlHighWatermark.isEmpty) {
       throw new IllegalArgumentException("High watermark and low watermark must be set" +
         " when enabling rate limit")
     }
 
+    // 初始化 CongestionController
     CongestionController.initialize(
       workerSource,
       conf.workerCongestionControlSampleTimeWindowSeconds.toInt,
@@ -131,9 +137,11 @@ private[celeborn] class Worker(
       conf.workerCongestionControlUserInactiveIntervalMs)
   }
 
+  // 创建 Controller，本质上是一个 RpcEndpoint
   var controller = new Controller(rpcEnv, conf, metricsSystem)
   rpcEnv.setupEndpoint(RpcNameConstants.WORKER_EP, controller)
 
+  // 启动一个 RPC 服务，用于接收来自 ShuffleClient 的 push data 请求
   val pushDataHandler = new PushDataHandler()
   val (pushServer, pushClientFactory) = {
     val closeIdleConnections = conf.workerCloseIdleConnections
@@ -154,6 +162,7 @@ private[celeborn] class Worker(
       transportContext.createClientFactory())
   }
 
+  // 启动一个 RPC 服务，用于接收来自其它 Worker 的 replicate data 请求
   val replicateHandler = new PushDataHandler()
   private val replicateServer = {
     val closeIdleConnections = conf.workerCloseIdleConnections
@@ -173,6 +182,7 @@ private[celeborn] class Worker(
     transportContext.createServer(conf.workerReplicatePort)
   }
 
+  // 启动一个 RPC 服务，用于接收来自 ShuffleClient 的 fetch data 请求
   var fetchHandler: FetchHandler = _
   private val fetchServer = {
     val closeIdleConnections = conf.workerCloseIdleConnections
@@ -199,6 +209,7 @@ private[celeborn] class Worker(
   private val replicatePort = replicateServer.getPort
   assert(replicatePort > 0, "worker replica bind port should be positive")
 
+  // 更新磁盘信息
   storageManager.updateDiskInfos()
 
   // WorkerInfo's diskInfos is a reference to storageManager.diskInfos
@@ -235,6 +246,7 @@ private[celeborn] class Worker(
   val shuffleCommitInfos: ConcurrentHashMap[String, ConcurrentHashMap[Long, CommitInfo]] =
     JavaUtils.newConcurrentHashMap[String, ConcurrentHashMap[Long, CommitInfo]]()
 
+  // Master RPC 客户端
   private val masterClient = new MasterClient(rpcEnv, conf)
 
   // (workerInfo -> last connect timeout timestamp)
@@ -363,9 +375,11 @@ private[celeborn] class Worker(
   }
 
   override def initialize(): Unit = {
+    // 启动 Metrics 系统
     super.initialize()
     logInfo(s"Starting Worker $host:$pushPort:$fetchPort:$replicatePort" +
       s" with ${workerInfo.diskInfos} slots.")
+    // 向 Master 注册
     registerWithMaster()
 
     // start heartbeat
@@ -374,7 +388,7 @@ private[celeborn] class Worker(
         override def run(): Unit = Utils.tryLogNonFatalError { heartbeatToMaster() }
       },
       heartbeatInterval,
-      heartbeatInterval,
+      heartbeatInterval, // 30s
       TimeUnit.MILLISECONDS)
 
     checkFastFailTask = forwardMessageScheduler.scheduleAtFixedRate(
@@ -388,7 +402,7 @@ private[celeborn] class Worker(
         }
       },
       0,
-      replicaFastFailDuration,
+      replicaFastFailDuration, // 60s
       TimeUnit.MILLISECONDS)
 
     cleaner = new Thread("Cleaner") {
@@ -724,7 +738,9 @@ private[celeborn] class Worker(
 
 private[deploy] object Worker extends Logging {
   def main(args: Array[String]): Unit = {
+    // 加载系统环境变量
     val conf = new CelebornConf
+    // 解析命令行参数、celeborn-defaults.properties
     val workerArgs = new WorkerArguments(args, conf)
     // There are many entries for setting the master address, and we should unify the entries as
     // much as possible. Therefore, if the user manually specifies the address of the Master when
@@ -735,7 +751,25 @@ private[deploy] object Worker extends Logging {
     }
 
     try {
+      /*
+       * 创建 Worker：
+       * 1. 启动 RPC 服务，端口随机，对应的处理器是 Controller
+       * 2. 创建 StorageManager
+       * 3. 初始化 MemoryManager
+       * 4. 如果启用拥塞控制，则初始化 CongestionController
+       * 5. 启动一个 RPC 服务，用于接收来自 ShuffleClient 的 push data 请求
+       * 6. 启动一个 RPC 服务，用于接收来自其它 Worker 的 replicate data 请求
+       * 7. 启动一个 RPC 服务，用于接收来自 ShuffleClient 的 fetch data 请求
+       */
       val worker = new Worker(conf, workerArgs)
+
+      /*
+       * 初始化：
+       * 1. 启动 Metrics 系统
+       * 2. 向 Master 注册
+       * 3. 启动一些周期性任务
+       * 4. 初始化一些 RPC 处理器（pushDataHandler, replicateHandler, fetchHandler, controller）
+       */
       worker.initialize()
     } catch {
       case e: Throwable =>
