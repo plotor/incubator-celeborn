@@ -17,6 +17,12 @@
 
 package org.apache.celeborn.client.write;
 
+import org.apache.celeborn.client.ShuffleClient;
+import org.apache.celeborn.common.CelebornConf;
+import org.apache.celeborn.common.exception.CelebornIOException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Objects;
@@ -28,20 +34,13 @@ import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import org.apache.celeborn.client.ShuffleClient;
-import org.apache.celeborn.common.CelebornConf;
-import org.apache.celeborn.common.exception.CelebornIOException;
-
 public class DataPusher {
   private static final Logger logger = LoggerFactory.getLogger(DataPusher.class);
 
   private final long WAIT_TIME_NANOS = TimeUnit.MILLISECONDS.toNanos(500);
 
   private final LinkedBlockingQueue<PushTask> idleQueue;
-  // partition -> PushTask Queue
+  // partition -> PushTask Queue，数据待发送任务队列
   private final DataPushQueue dataPushQueue;
   private final ReentrantLock idleLock = new ReentrantLock();
   private final Condition idleFull = idleLock.newCondition();
@@ -73,7 +72,9 @@ public class DataPusher {
       Consumer<Integer> afterPush,
       LongAdder[] mapStatusLengths)
       throws InterruptedException {
+    // celeborn.push.queue.capacity，默认 512
     final int pushQueueCapacity = conf.clientPushQueueCapacity();
+    // celeborn.push.buffer.max.size，默认 64K
     final int pushBufferMaxSize = conf.clientPushBufferMaxSize();
 
     if (pushTasks == null) {
@@ -81,10 +82,12 @@ public class DataPusher {
     } else {
       idleQueue = pushTasks;
     }
+    // partition -> PushTask Queue
     dataPushQueue =
         new DataPushQueue(
             conf, this, client, shuffleId, mapId, attemptId, numMappers, numPartitions);
 
+    // 初始化空闲的 PushTask 队列
     for (int i = idleQueue.size(); i < pushQueueCapacity; i++) {
       idleQueue.put(new PushTask(pushBufferMaxSize));
     }
@@ -103,6 +106,7 @@ public class DataPusher {
           private void reclaimTask(PushTask task) throws InterruptedException {
             idleLock.lockInterruptibly();
             try {
+              // 添加一个空闲 PushTask
               idleQueue.put(task);
               if (idleQueue.remainingCapacity() == 0) {
                 idleFull.signal();
@@ -119,10 +123,13 @@ public class DataPusher {
           public void run() {
             while (stillRunning()) {
               try {
+                // 获取所有的 PushTask 集合，控制发往同一个 Worker 的任务数，如果 InFlight 过多则先过滤掉这些任务
                 ArrayList<PushTask> tasks = dataPushQueue.takePushTasks();
                 for (int i = 0; i < tasks.size(); i++) {
                   PushTask task = tasks.get(i);
+                  // 执行 ShuffleClient#pushData
                   pushData(task);
+                  // 添加一个空闲 PushTask
                   reclaimTask(task);
                 }
               } catch (CelebornIOException e) {
@@ -140,6 +147,9 @@ public class DataPusher {
     pushThread.start();
   }
 
+  /**
+   * 添加 PushTask 到任务队列
+   */
   public void addTask(int partitionId, byte[] buffer, int size)
       throws IOException, InterruptedException {
     try {
@@ -151,6 +161,7 @@ public class DataPusher {
       task.setSize(size);
       task.setPartitionId(partitionId);
       System.arraycopy(buffer, 0, task.getBuffer(), 0, size);
+      // 任务入队列
       while (!dataPushQueue.addPushTask(task)) {
         checkException();
       }
@@ -205,6 +216,7 @@ public class DataPusher {
             task.getSize(),
             numMappers,
             numPartitions);
+    // metrics
     afterPush.accept(bytesWritten);
     mapStatusLengths[task.getPartitionId()].add(bytesWritten);
   }

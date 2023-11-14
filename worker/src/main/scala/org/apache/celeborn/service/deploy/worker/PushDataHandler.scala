@@ -392,7 +392,7 @@ class PushDataHandler extends BaseMessageHandler with Logging {
       case e: Exception =>
         logError("Exception encountered when write.", e)
     }
-  }
+  } // end of handlePushData
 
   def handlePushMergedData(
       pushMergedData: PushMergedData,

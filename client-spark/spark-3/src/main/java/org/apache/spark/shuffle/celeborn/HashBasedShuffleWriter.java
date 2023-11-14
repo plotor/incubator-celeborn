@@ -17,18 +17,12 @@
 
 package org.apache.spark.shuffle.celeborn;
 
-import java.io.IOException;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.atomic.LongAdder;
-
-import javax.annotation.Nullable;
-
-import scala.Option;
-import scala.Product2;
-import scala.reflect.ClassTag;
-import scala.reflect.ClassTag$;
-
 import com.google.common.annotations.VisibleForTesting;
+import org.apache.celeborn.client.ShuffleClient;
+import org.apache.celeborn.client.write.DataPusher;
+import org.apache.celeborn.client.write.PushTask;
+import org.apache.celeborn.common.CelebornConf;
+import org.apache.celeborn.common.util.Utils;
 import org.apache.spark.Partitioner;
 import org.apache.spark.ShuffleDependency;
 import org.apache.spark.SparkEnv;
@@ -50,12 +44,15 @@ import org.apache.spark.storage.BlockManagerId;
 import org.apache.spark.unsafe.Platform;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import scala.Option;
+import scala.Product2;
+import scala.reflect.ClassTag;
+import scala.reflect.ClassTag$;
 
-import org.apache.celeborn.client.ShuffleClient;
-import org.apache.celeborn.client.write.DataPusher;
-import org.apache.celeborn.client.write.PushTask;
-import org.apache.celeborn.common.CelebornConf;
-import org.apache.celeborn.common.util.Utils;
+import javax.annotation.Nullable;
+import java.io.IOException;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.atomic.LongAdder;
 
 @Private
 public class HashBasedShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
@@ -84,7 +81,9 @@ public class HashBasedShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
   private final OpenByteArrayOutputStream serBuffer;
   private final SerializationStream serOutputStream;
 
+  /* 记录缓存待发送数据的 buffer，index 为 partitionId */
   private byte[][] sendBuffers;
+  /* 记录缓存待发送数据的 offset，index 为 partitionId */
   private int[] sendOffsets;
 
   private final LongAdder[] mapStatusLengths;
@@ -142,6 +141,7 @@ public class HashBasedShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
     this.shuffleClient = client;
     this.conf = conf;
 
+    // celeborn.client.spark.push.unsafeRow.fastWrite.enabled
     unsafeRowFastWrite = conf.clientPushUnsafeRowFastWrite();
     serBuffer = new OpenByteArrayOutputStream(DEFAULT_INITIAL_SER_BUFFER_SIZE);
     serOutputStream = serializer.serializeStream(serBuffer);
@@ -152,7 +152,9 @@ public class HashBasedShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
     }
     tmpRecords = new long[numPartitions];
 
+    // celeborn.push.buffer.initial.size，默认 8K
     PUSH_BUFFER_INIT_SIZE = conf.clientPushBufferInitialSize();
+    // celeborn.push.buffer.max.size，默认 64K
     PUSH_BUFFER_MAX_SIZE = conf.clientPushBufferMaxSize();
 
     this.sendBufferPool = sendBufferPool;
@@ -161,6 +163,7 @@ public class HashBasedShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
 
     try {
       LinkedBlockingQueue<PushTask> pushTaskQueue = sendBufferPool.acquirePushTaskQueue();
+      // 实例化 DataPusher
       dataPusher =
           new DataPusher(
               shuffleId,
@@ -216,6 +219,10 @@ public class HashBasedShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
   @VisibleForTesting
   boolean canUseFastWrite() {
     boolean keyIsPartitionId = false;
+    /*
+     * 1. celeborn.client.spark.push.unsafeRow.fastWrite.enabled=true
+     * 2. Use UnsafeRowSerializer
+     */
     if (unsafeRowFastWrite && dep.serializer() instanceof UnsafeRowSerializer) {
       // SPARK-39391 renames PartitionIdPassthrough's package
       String partitionerClassName = partitioner.getClass().getSimpleName();
@@ -309,23 +316,34 @@ public class HashBasedShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
   private void write0(scala.collection.Iterator iterator) throws IOException, InterruptedException {
     final scala.collection.Iterator<Product2<K, ?>> records = iterator;
 
+    // 遍历处理数据条目
     while (records.hasNext()) {
       final Product2<K, ?> record = records.next();
       final K key = record._1();
+      // 获取分区 ID
       final int partitionId = partitioner.getPartition(key);
       serBuffer.reset();
       serOutputStream.writeKey(key, OBJECT_CLASS_TAG);
       serOutputStream.writeValue(record._2(), OBJECT_CLASS_TAG);
       serOutputStream.flush();
 
+      // 当前数据条目序列化后的长度
       final int serializedRecordSize = serBuffer.size();
       assert (serializedRecordSize > 0);
 
+      // 如果单个数据条目长度超出阈值（对应 celeborn.push.buffer.max.size 配置，默认 64K）
       if (serializedRecordSize > PUSH_BUFFER_MAX_SIZE) {
+        // 直接调用 ShuffleClient 往目标 Worker 写数据（异步 RPC 请求）
         pushGiantRecord(partitionId, serBuffer.getBuf(), serializedRecordSize);
       } else {
+        /*
+         * 获取指定分区 buffer 数据 offset，如果容纳不下则会尝试对 buffer 扩容，
+         * 仍然放不下则会构造异步任务 PushTask 将数据 push 出去以腾出缓冲区
+         */
         int offset = getOrUpdateOffset(partitionId, serializedRecordSize);
+        // 获取指定分区的待发送数据缓冲区，如果不存在则创建
         byte[] buffer = getOrCreateBuffer(partitionId);
+        // 将数据写入缓冲区，并更新缓冲区中的数据 offset
         System.arraycopy(serBuffer.getBuf(), 0, buffer, offset, serializedRecordSize);
         sendOffsets[partitionId] = offset + serializedRecordSize;
       }
@@ -333,9 +351,13 @@ public class HashBasedShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
     }
   }
 
+  /**
+   * 获取指定分区的待发送数据缓冲区，如果不存在则创建
+   */
   private byte[] getOrCreateBuffer(int partitionId) {
     byte[] buffer = sendBuffers[partitionId];
     if (buffer == null) {
+      // 创建 partition 对应的 buffer，初始大小默认为 8k
       buffer = new byte[PUSH_BUFFER_INIT_SIZE];
       sendBuffers[partitionId] = buffer;
       peakMemoryUsedBytes += PUSH_BUFFER_INIT_SIZE;
@@ -360,10 +382,20 @@ public class HashBasedShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
     writeMetrics.incBytesWritten(bytesWritten);
   }
 
+  /**
+   * 获取指定分区 buffer 数据 offset，如果容纳不下则会尝试对 buffer 扩容，
+   * 仍然放不下则会构造异步任务 PushTask 将数据 push 出去以腾出缓冲区
+   *
+   * @param partitionId          分区 ID
+   * @param serializedRecordSize 待缓存的数据长度
+   */
   private int getOrUpdateOffset(int partitionId, int serializedRecordSize)
       throws IOException, InterruptedException {
     int offset = sendOffsets[partitionId];
+    // 获取 or 创建指定 partition 对应的 buffer
     byte[] buffer = getOrCreateBuffer(partitionId);
+    // buffer 容纳不下，但是 buffer 长度还未达到阈值上限，
+    // 则对 buffer 进行扩容，扩容后的大小为 min(buffer.length * 2, PUSH_BUFFER_MAX_SIZE)
     while ((buffer.length - offset) < serializedRecordSize
         && buffer.length < PUSH_BUFFER_MAX_SIZE) {
 
@@ -374,7 +406,9 @@ public class HashBasedShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
       buffer = newBuffer;
     }
 
+    // 仍然容纳不下
     if ((buffer.length - offset) < serializedRecordSize) {
+      // 为缓冲数据构造 PushTask，添加到任务队列
       flushSendBuffer(partitionId, buffer, offset);
       updateMapStatus();
       offset = 0;
@@ -382,10 +416,18 @@ public class HashBasedShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
     return offset;
   }
 
+  /**
+   * 添加 PushTask 到任务队列
+   *
+   * @param partitionId 分区 ID
+   * @param buffer      缓冲区
+   * @param size        目前数据长度
+   */
   private void flushSendBuffer(int partitionId, byte[] buffer, int size)
       throws IOException, InterruptedException {
     long start = System.nanoTime();
     logger.debug("Flush buffer, size {}.", Utils.bytesToString(size));
+    // 添加 PushTask 到任务队列
     dataPusher.addTask(partitionId, buffer, size);
     writeMetrics.incWriteTime(System.nanoTime() - start);
   }

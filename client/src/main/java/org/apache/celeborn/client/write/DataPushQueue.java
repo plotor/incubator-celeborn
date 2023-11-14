@@ -17,20 +17,22 @@
 
 package org.apache.celeborn.client.write;
 
-import java.io.IOException;
-import java.util.*;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import org.apache.celeborn.client.ShuffleClient;
 import org.apache.celeborn.common.CelebornConf;
 import org.apache.celeborn.common.protocol.PartitionLocation;
 import org.apache.celeborn.common.util.Utils;
 import org.apache.celeborn.common.write.PushState;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /*
  * Queue for push data,
@@ -70,17 +72,21 @@ public class DataPushQueue {
     this.dataPusher = dataPusher;
     final String mapKey = Utils.makeMapKey(shuffleId, mapId, attemptId);
     this.pushState = client.getPushState(mapKey);
+    // celeborn.client.push.maxReqsInFlight.perWorker, 默认 32
     this.maxInFlightPerWorker = conf.clientPushMaxReqsInFlightPerWorker();
     this.takeTaskWaitIntervalMs = conf.clientPushTakeTaskWaitIntervalMs();
+    // celeborn.client.push.takeTaskMaxWaitAttempts，默认 1
     this.takeTaskMaxWaitAttempts = conf.clientPushTakeTaskMaxWaitAttempts();
     final int capacity = conf.clientPushQueueCapacity();
     workingQueue = new LinkedBlockingQueue<>(capacity);
   }
 
-  /*
+  /**
+   * 获取所有的 PushTask 集合，控制发往同一个 worker 的任务数，如果 InFlight 过多则先过滤掉这些任务
+   * <p>
    * Now, `takePushTasks` is only used by one thread,
    * so it is not thread-safe.
-   * */
+   */
   public ArrayList<PushTask> takePushTasks() throws IOException, InterruptedException {
     ArrayList<PushTask> tasks = new ArrayList<>();
     HashMap<String, Integer> workerCapacity = new HashMap<>();
@@ -94,6 +100,7 @@ public class DataPushQueue {
       while (iterator.hasNext()) {
         PushTask task = iterator.next();
         int partitionId = task.getPartitionId();
+        // 获取指定 shuffle 对应的 (PartitionId, PartitionLocation) 信息
         Map<Integer, PartitionLocation> partitionLocationMap =
             client.getPartitionLocation(shuffleId, numMappers, numPartitions);
         if (partitionLocationMap != null) {

@@ -18,9 +18,12 @@
 package org.apache.celeborn.client.write;
 
 public class PushTask {
+  /* 分区 ID */
   private int partitionId;
+  /* 数据长度 */
   private int size;
 
+  /* 缓冲区 */
   private byte[] buffer;
 
   public PushTask(int bufferSize) {

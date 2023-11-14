@@ -17,23 +17,9 @@
 
 package org.apache.celeborn.client;
 
-import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.util.*;
-import java.util.concurrent.Callable;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.TimeUnit;
-
-import scala.reflect.ClassTag$;
-
 import com.google.common.annotations.VisibleForTesting;
 import io.netty.buffer.CompositeByteBuf;
 import io.netty.buffer.Unpooled;
-import org.apache.commons.lang3.tuple.Pair;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import org.apache.celeborn.client.compress.Compressor;
 import org.apache.celeborn.client.read.CelebornInputStream;
 import org.apache.celeborn.common.CelebornConf;
@@ -55,9 +41,24 @@ import org.apache.celeborn.common.rpc.RpcAddress;
 import org.apache.celeborn.common.rpc.RpcEndpointRef;
 import org.apache.celeborn.common.rpc.RpcEnv;
 import org.apache.celeborn.common.unsafe.Platform;
-import org.apache.celeborn.common.util.*;
+import org.apache.celeborn.common.util.JavaUtils;
+import org.apache.celeborn.common.util.PbSerDeUtils;
+import org.apache.celeborn.common.util.ThreadUtils;
+import org.apache.celeborn.common.util.Utils;
 import org.apache.celeborn.common.write.DataBatches;
 import org.apache.celeborn.common.write.PushState;
+import org.apache.commons.lang3.tuple.Pair;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import scala.reflect.ClassTag$;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.*;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
 
 public class ShuffleClientImpl extends ShuffleClient {
   private static final Logger logger = LoggerFactory.getLogger(ShuffleClientImpl.class);
@@ -79,12 +80,14 @@ public class ShuffleClientImpl extends ShuffleClient {
 
   private final RpcEnv rpcEnv;
 
+  /* LifeCycleManager RPC 客户端 */
   protected RpcEndpointRef lifecycleManagerRef;
 
   protected TransportClientFactory dataClientFactory;
 
   protected final int BATCH_HEADER_SIZE = 4 * 4;
 
+  // 针对每个 shuffle 缓存分区和分区位置信息（）
   // key: shuffleId, value: (partitionId, PartitionLocation)
   final Map<Integer, ConcurrentHashMap<Integer, PartitionLocation>> reducePartitionMap =
       JavaUtils.newConcurrentHashMap();
@@ -100,6 +103,7 @@ public class ShuffleClientImpl extends ShuffleClient {
   protected final Map<String, PushState> pushStates = JavaUtils.newConcurrentHashMap();
 
   private final boolean pushExcludeWorkerOnFailureEnabled;
+  // 是否启用压缩
   private final boolean shuffleCompressionEnabled;
   private final Set<String> pushExcludedWorkers = ConcurrentHashMap.newKeySet();
   private final ConcurrentHashMap<String, Long> fetchExcludedWorkers =
@@ -468,11 +472,12 @@ public class ShuffleClientImpl extends ShuffleClient {
         shuffleId,
         numMappers,
         numPartitions,
-        () ->
-            lifecycleManagerRef.askSync(
-                RegisterShuffle$.MODULE$.apply(shuffleId, numMappers, numPartitions),
-                conf.clientRpcRegisterShuffleRpcAskTimeout(),
-                ClassTag$.MODULE$.apply(PbRegisterShuffleResponse.class)));
+            () ->
+                    // 同步发送 PbRegisterShuffle 请求，以获取当前 shuffle 对应的 (PartitionId, PartitionLocation) 信息
+                    lifecycleManagerRef.askSync(
+                            RegisterShuffle$.MODULE$.apply(shuffleId, numMappers, numPartitions),
+                            conf.clientRpcRegisterShuffleRpcAskTimeout(),
+                            ClassTag$.MODULE$.apply(PbRegisterShuffleResponse.class)));
   }
 
   @VisibleForTesting
@@ -507,6 +512,8 @@ public class ShuffleClientImpl extends ShuffleClient {
   @Override
   public ConcurrentHashMap<Integer, PartitionLocation> getPartitionLocation(
       int shuffleId, int numMappers, int numPartitions) {
+    // 获取指定 shuffle 对应的 (PartitionId, PartitionLocation) 信息，
+    // 如果不存在则同步发送 PbRegisterShuffle 请求，以请求 LifeCycleManager 获取
     return reducePartitionMap.computeIfAbsent(
         shuffleId, (id) -> registerShuffle(shuffleId, numMappers, numPartitions));
   }
@@ -657,6 +664,7 @@ public class ShuffleClientImpl extends ShuffleClient {
       int epoch,
       PartitionLocation oldLocation,
       StatusCode cause) {
+    // 按照错误原因排除对应 Worker
     excludeWorkerByCause(cause, oldLocation);
 
     Set<Integer> mapIds = new HashSet<>();
@@ -773,7 +781,7 @@ public class ShuffleClientImpl extends ShuffleClient {
       int length,
       int numMappers,
       int numPartitions,
-      boolean doPush)
+      boolean doPush) // 控制是 push 还是 merge
       throws IOException {
     // mapKey
     final String mapKey = Utils.makeMapKey(shuffleId, mapId, attemptId);
@@ -792,6 +800,7 @@ public class ShuffleClientImpl extends ShuffleClient {
       return 0;
     }
     // register shuffle if not registered
+    // 获取指定 shuffle 对应的 (PartitionId, PartitionLocation) 信息
     final ConcurrentHashMap<Integer, PartitionLocation> map =
         getPartitionLocation(shuffleId, numMappers, numPartitions);
 
@@ -803,6 +812,7 @@ public class ShuffleClientImpl extends ShuffleClient {
     // If rerun or speculation task running after LifecycleManager call stageEnd,
     // register shuffle will return an empty location map, client need revive for a new location.
     if (!map.containsKey(partitionId)) {
+      // 尝试 revive 制定 partition
       if (!revive(
           shuffleId,
           mapId,
@@ -816,6 +826,7 @@ public class ShuffleClientImpl extends ShuffleClient {
       }
     }
 
+    // shuffle stage already ended
     if (mapperEnded(shuffleId, mapId)) {
       logger.debug(
           "Push or merge data ignored because mapper already ended for shuffle {} map {} attempt {} partition {}.",
@@ -842,6 +853,7 @@ public class ShuffleClientImpl extends ShuffleClient {
     // increment batchId
     final int nextBatchId = pushState.nextBatchId();
 
+    // 启用 shuffle 数据压缩
     if (shuffleCompressionEnabled) {
       // compress data
       final Compressor compressor = compressorThreadLocal.get();
@@ -897,7 +909,7 @@ public class ShuffleClientImpl extends ShuffleClient {
                       loc, shuffleId, mapId, attemptId, partitionId, nextBatchId);
               pushState.exception.compareAndSet(null, new CelebornIOException(errorMsg, e));
             }
-          };
+          }; // end of RpcResponseCallback
 
       RpcResponseCallback wrappedCallback =
           new PushDataRpcResponseCallback() {
@@ -1064,14 +1076,17 @@ public class ShuffleClientImpl extends ShuffleClient {
                     remainReviveTimes);
               }
             }
-          };
+          }; // end of PushDataRpcResponseCallback
 
       // do push data
       try {
+        // 校验可以向目标 Worker 推送数据
         if (!isPushTargetWorkerExcluded(loc, wrappedCallback)) {
           if (!testRetryRevive) {
+            // 创建 RPC 客户端
             TransportClient client =
                 dataClientFactory.createClient(loc.getHost(), loc.getPushPort(), partitionId);
+            // 发送 RPC 请求推送数据
             client.pushData(pushData, pushDataTimeout, wrappedCallback);
           } else {
             wrappedCallback.onFailure(

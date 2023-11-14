@@ -81,8 +81,10 @@ public class SparkShuffleManager implements ShuffleManager {
     }
     this.conf = conf;
     this.isDriver = isDriver;
+    // 从 spark-defaults.conf 中解析所有以 "spark.celeborn." 开头的配置项
     this.celebornConf = SparkUtils.fromSparkConf(conf);
     this.cores = executorCores(conf);
+    // 创建 Fallback 决策器
     this.fallbackPolicyRunner = new CelebornShuffleFallbackPolicyRunner(celebornConf);
     if (ShuffleMode.SORT.equals(celebornConf.shuffleWriterMode())
         && celebornConf.clientPushSortPipelineEnabled()) {
@@ -118,6 +120,7 @@ public class SparkShuffleManager implements ShuffleManager {
     if (isDriver && lifecycleManager == null) {
       synchronized (this) {
         if (lifecycleManager == null) {
+          // 如果是 Driver 节点，则创建并初始化 LifecycleManager
           lifecycleManager = new LifecycleManager(appUniqueId, celebornConf);
         }
       }
@@ -204,9 +207,11 @@ public class SparkShuffleManager implements ShuffleManager {
   public <K, V> ShuffleWriter<K, V> getWriter(
       ShuffleHandle handle, long mapId, TaskContext context, ShuffleWriteMetricsReporter metrics) {
     try {
+      // 走 RSS
       if (handle instanceof CelebornShuffleHandle) {
         @SuppressWarnings("unchecked")
         CelebornShuffleHandle<K, V, ?> h = ((CelebornShuffleHandle<K, V, ?>) handle);
+        // 获取 or 创建并初始化 ShuffleClient
         shuffleClient =
             ShuffleClient.get(
                 h.appUniqueId(),
@@ -214,6 +219,7 @@ public class SparkShuffleManager implements ShuffleManager {
                 h.lifecycleManagerPort(),
                 celebornConf,
                 h.userIdentifier());
+        // celeborn.shuffle.writer=SORT
         if (ShuffleMode.SORT.equals(celebornConf.shuffleWriterMode())) {
           ExecutorService pushThread =
               celebornConf.clientPushSortPipelineEnabled() ? getPusherThread() : null;
@@ -226,7 +232,9 @@ public class SparkShuffleManager implements ShuffleManager {
               metrics,
               pushThread,
               SendBufferPool.get(cores, sendBufferPoolCheckInterval, sendBufferPoolExpireTimeout));
-        } else if (ShuffleMode.HASH.equals(celebornConf.shuffleWriterMode())) {
+        }
+        // celeborn.shuffle.writer=HASH
+        else if (ShuffleMode.HASH.equals(celebornConf.shuffleWriterMode())) {
           return new HashBasedShuffleWriter<>(
               h,
               context,
@@ -238,7 +246,9 @@ public class SparkShuffleManager implements ShuffleManager {
           throw new UnsupportedOperationException(
               "Unrecognized shuffle write mode!" + celebornConf.shuffleWriterMode());
         }
-      } else {
+      }
+      // Fallback 到原生 Shuffle
+      else {
         sortShuffleIds.add(handle.shuffleId());
         return sortShuffleManager().getWriter(handle, mapId, context, metrics);
       }
@@ -256,6 +266,7 @@ public class SparkShuffleManager implements ShuffleManager {
       int endPartition,
       TaskContext context,
       ShuffleReadMetricsReporter metrics) {
+    // 走 RSS
     if (handle instanceof CelebornShuffleHandle) {
       @SuppressWarnings("unchecked")
       CelebornShuffleHandle<K, ?, C> h = (CelebornShuffleHandle<K, ?, C>) handle;

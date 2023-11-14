@@ -101,6 +101,7 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
   }
 
   // register shuffle request waiting for response
+  // 记录正在处理中的 RegisterShuffle 请求，key 是 shuffleId
   private val registeringShuffleRequest =
     JavaUtils.newConcurrentHashMap[Int, util.Set[RegisterCallContext]]()
 
@@ -124,7 +125,7 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
   private val masterClient = new MasterClient(rpcEnv, conf)
   // 创建 CommitManager
   val commitManager = new CommitManager(appUniqueId, conf, this)
-  // 创建 CommitManager
+  // 创建 WorkerStatusTracker
   val workerStatusTracker = new WorkerStatusTracker(conf, this)
   private val heartbeater =
     new ApplicationHeartbeater(
@@ -158,7 +159,7 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
         }
       },
       shuffleExpiredCheckIntervalMs,
-      shuffleExpiredCheckIntervalMs,
+      shuffleExpiredCheckIntervalMs, // 60s
       TimeUnit.MILLISECONDS)
   }
 
